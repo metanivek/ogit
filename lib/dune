@@ -1,0 +1,3 @@
+(library
+ (name ls_git_pack)
+ (libraries checkseum.ocaml decompress.zl))
