@@ -1,3 +1,5 @@
 (library
  (name ls_git_pack)
- (libraries checkseum.ocaml decompress.zl))
+ (libraries checkseum.ocaml decompress.zl)
+ (inline_tests)
+ (preprocess (pps ppx_inline_test ppx_assert)))

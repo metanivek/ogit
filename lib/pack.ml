@@ -23,7 +23,19 @@ type entry = {
 type t = { header : header; entries : entry list; trailer : bytes }
 
 let test_pack =
-  ".git/objects/pack/pack-b1d1fa42c7419f9b3b2b6296b0ce93d3d1312d6b.pack"
+  ".git/objects/pack/pack-08631b7e544a9618098922174a04f29e70d72ae4.pack"
+
+let object_type_to_string = function
+  | Invalid -> "invalid"
+  | Commit -> "commit"
+  | Tree -> "tree"
+  | Blob -> "blob"
+  | Tag -> "Tag"
+  | Reserved -> "reserved"
+  | Ofs_Delta -> "offset delta"
+  | Ref_Delta -> "ref delta"
+
+let next_byte ic () = input_byte ic
 
 let parse_header ic =
   let header_len = 12 in
@@ -48,24 +60,10 @@ let parse_object_type ic =
   | 2 -> Tree
   | 3 -> Blob
   | 4 -> Tag
+  | 5 -> Reserved
   | 6 -> Ofs_Delta
   | 7 -> Ref_Delta
   | _ -> Invalid
-
-let parse_size_encoding ic =
-  seek_in ic (pos_in ic - 1);
-  let rec parse byte size shift =
-    if byte land 0x80 = 0 then size
-    else
-      let byte = input_byte ic in
-      let new_size = (byte land 0x7f) lsl shift in
-      let size = size lor new_size in
-      let shift = shift + 7 in
-      parse byte size shift
-  in
-  let byte = input_byte ic in
-  let size = byte land 0x0f in
-  parse byte size 4
 
 let parse_data ic =
   let open Zl in
@@ -95,19 +93,73 @@ let parse_data ic =
     | `End decoder ->
         let len = De.io_buffer_size - Inf.dst_rem decoder in
         if len > 0 then bigstring_output o len;
-        Ok buf
+        Ok (Buffer.to_bytes buf)
   in
   go decoder
 
-let parse_entry ic =
+let rec parse_entry ic =
+  let pos = pos_in ic in
   let object_type = parse_object_type ic in
-  let length = parse_size_encoding ic in
-  let data =
-    match parse_data ic with
-    | Error _ as e -> e
-    | Ok b -> Ok (Buffer.to_bytes b)
+  seek_in ic (pos_in ic - 1);
+  (* move back one since object type byte has part of the size *)
+  let length = Encoding.read_size ~nibble:true (next_byte ic) in
+  let object_type, data =
+    match object_type with
+    | Ofs_Delta -> parse_ofs_delta ic pos
+    | Ref_Delta -> failwith "not implemented"
+    | _ -> (object_type, parse_data ic)
   in
   { object_type; length; data }
+
+and parse_ofs_delta ic pos =
+  let offset = Encoding.read_offset (next_byte ic) in
+  let offset_pos = pos - offset in
+  let data_pos = pos_in ic in
+  seek_in ic offset_pos;
+  let entry = parse_entry ic in
+  seek_in ic data_pos;
+  let transform_data = parse_data ic in
+  match (entry.data, transform_data) with
+  | _, Error _ | Error _, _ -> failwith "error parsing ofs delta"
+  | Ok base_data, Ok transform_data ->
+      let buf = Buffer.create 0 in
+      let s = Stream.of_bytes transform_data in
+      let next_byte () = Stream.next s in
+      let next_int () = next_byte () |> Char.code in
+      let read_bytes n = Bytes.init n (fun _ -> next_byte ()) in
+      let src_size = Encoding.read_size next_int in
+      let dst_size = Encoding.read_size next_int in
+      assert (src_size = Bytes.length base_data);
+      while Option.is_some @@ Stream.peek s do
+        let byte = next_int () in
+        if byte = 0 then failwith "unexpected delta opcode 0"
+        else if byte land 0x80 != 0 then
+          (* copy data *)
+          let vals =
+            Array.init 7 Fun.id
+            |> Array.map (fun i ->
+                   let mask = 1 lsl i in
+                   if byte land mask != 0 then next_int () else 0)
+          in
+          let get_int_le bytes =
+            let value = ref 0 in
+            bytes
+            |> Array.iteri (fun i b ->
+                   let shift = i * 8 in
+                   value := !value lor (b lsl shift));
+            !value
+          in
+          let offset = get_int_le (Array.sub vals 0 4) in
+          let size = get_int_le (Array.sub vals 4 3) in
+          let size = if size = 0 then 0x10000 else size in
+          Buffer.add_bytes buf (Bytes.sub base_data offset size)
+        else
+          (* append data *)
+          let size = byte land 0x7f in
+          Buffer.add_bytes buf (read_bytes size)
+      done;
+      assert (dst_size = Buffer.length buf);
+      (entry.object_type, Ok (Buffer.to_bytes buf))
 
 let parse_entries ic n =
   let entries = ref [] in
@@ -118,7 +170,7 @@ let parse_entries ic n =
   List.rev !entries
 
 let parse_trailer ic =
-  let len = (in_channel_length ic) - (pos_in ic) in
+  let len = in_channel_length ic - pos_in ic in
   let b = Bytes.create len in
   really_input ic b 0 len;
   b
