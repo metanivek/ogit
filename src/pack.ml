@@ -17,13 +17,20 @@ type object_type =
 type entry = {
   object_type : object_type;
   length : int;
-  data : (bytes, string) result;
+  data : bytes;
+  original_object_type : object_type;
+  offset : int;
 }
 
 type t = { header : header; entries : entry list; trailer : bytes }
 
-let test_pack =
-  ".git/objects/pack/pack-08631b7e544a9618098922174a04f29e70d72ae4.pack"
+type error =
+  | Invalid_data of string
+  | Not_supported of string
+  | Failed of string
+  | Partial_entries of t * error
+
+type read_result = (t, error) result
 
 let object_type_to_string = function
   | Invalid -> "invalid"
@@ -89,7 +96,7 @@ let parse_data ic =
         let len = De.io_buffer_size - Inf.dst_rem decoder in
         bigstring_output o len;
         Inf.flush decoder |> go
-    | `Malformed err -> Error (Format.asprintf "%s." err)
+    | `Malformed err -> Error (Invalid_data (Format.asprintf "%s." err))
     | `End decoder ->
         let len = De.io_buffer_size - Inf.dst_rem decoder in
         if len > 0 then bigstring_output o len;
@@ -99,17 +106,20 @@ let parse_data ic =
 
 let rec parse_entry ic =
   let pos = pos_in ic in
-  let object_type = parse_object_type ic in
+  let original_object_type = parse_object_type ic in
   seek_in ic (pos_in ic - 1);
   (* move back one since object type byte has part of the size *)
   let length = Encoding.read_size ~nibble:true (next_byte ic) in
   let object_type, data =
-    match object_type with
+    match original_object_type with
     | Ofs_Delta -> parse_ofs_delta ic pos
-    | Ref_Delta -> failwith "not implemented"
-    | _ -> (object_type, parse_data ic)
+    | Ref_Delta -> (Invalid, Error (Not_supported "ref delta"))
+    | _ -> (original_object_type, parse_data ic)
   in
-  { object_type; length; data }
+  match data with
+  | Ok data ->
+      Ok { object_type; length; data; offset = pos; original_object_type }
+  | Error _ as e -> e
 
 and parse_ofs_delta ic pos =
   let offset = Encoding.read_offset (next_byte ic) in
@@ -117,57 +127,68 @@ and parse_ofs_delta ic pos =
   let data_pos = pos_in ic in
   seek_in ic offset_pos;
   let entry = parse_entry ic in
-  seek_in ic data_pos;
-  let transform_data = parse_data ic in
-  match (entry.data, transform_data) with
-  | _, Error _ | Error _, _ -> failwith "error parsing ofs delta"
-  | Ok base_data, Ok transform_data ->
-      let buf = Buffer.create 0 in
-      let s = Stream.of_bytes transform_data in
-      let next_byte () = Stream.next s in
-      let next_int () = next_byte () |> Char.code in
-      let read_bytes n = Bytes.init n (fun _ -> next_byte ()) in
-      let src_size = Encoding.read_size next_int in
-      let dst_size = Encoding.read_size next_int in
-      assert (src_size = Bytes.length base_data);
-      while Option.is_some @@ Stream.peek s do
-        let byte = next_int () in
-        if byte = 0 then failwith "unexpected delta opcode 0"
-        else if byte land 0x80 != 0 then
-          (* copy data *)
-          let vals =
-            Array.init 7 Fun.id
-            |> Array.map (fun i ->
-                   let mask = 1 lsl i in
-                   if byte land mask != 0 then next_int () else 0)
-          in
-          let get_int_le bytes =
-            let value = ref 0 in
-            bytes
-            |> Array.iteri (fun i b ->
-                   let shift = i * 8 in
-                   value := !value lor (b lsl shift));
-            !value
-          in
-          let offset = get_int_le (Array.sub vals 0 4) in
-          let size = get_int_le (Array.sub vals 4 3) in
-          let size = if size = 0 then 0x10000 else size in
-          Buffer.add_bytes buf (Bytes.sub base_data offset size)
-        else
-          (* append data *)
-          let size = byte land 0x7f in
-          Buffer.add_bytes buf (read_bytes size)
-      done;
-      assert (dst_size = Buffer.length buf);
-      (entry.object_type, Ok (Buffer.to_bytes buf))
+  match entry with
+  | Error _ as e -> (Invalid, e)
+  | Ok entry -> (
+      seek_in ic data_pos;
+      let transform_data = parse_data ic in
+      match (entry.data, transform_data) with
+      | _, Error _ -> (Invalid, Error (Failed "error parsing ofs delta"))
+      | base_data, Ok transform_data ->
+          let buf = Buffer.create 0 in
+          let s = Stream.of_bytes transform_data in
+          let next_byte () = Stream.next s in
+          let next_int () = next_byte () |> Char.code in
+          let read_bytes n = Bytes.init n (fun _ -> next_byte ()) in
+          let src_size = Encoding.read_size next_int in
+          let dst_size = Encoding.read_size next_int in
+          assert (src_size = Bytes.length base_data);
+          while Option.is_some @@ Stream.peek s do
+            let byte = next_int () in
+            if byte = 0 then failwith "unexpected delta opcode 0"
+            else if byte land 0x80 != 0 then
+              (* copy data *)
+              let vals =
+                Array.init 7 Fun.id
+                |> Array.map (fun i ->
+                       let mask = 1 lsl i in
+                       if byte land mask != 0 then next_int () else 0)
+              in
+              let get_int_le bytes =
+                let value = ref 0 in
+                bytes
+                |> Array.iteri (fun i b ->
+                       let shift = i * 8 in
+                       value := !value lor (b lsl shift));
+                !value
+              in
+              let offset = get_int_le (Array.sub vals 0 4) in
+              let size = get_int_le (Array.sub vals 4 3) in
+              let size = if size = 0 then 0x10000 else size in
+              Buffer.add_bytes buf (Bytes.sub base_data offset size)
+            else
+              (* append data *)
+              let size = byte land 0x7f in
+              Buffer.add_bytes buf (read_bytes size)
+          done;
+          assert (dst_size = Buffer.length buf);
+          (entry.object_type, Ok (Buffer.to_bytes buf)))
 
 let parse_entries ic n =
-  let entries = ref [] in
-  for _ = 1 to n do
-    let entry = parse_entry ic in
-    entries := entry :: !entries
-  done;
-  List.rev !entries
+  match
+    List.init n Fun.id
+    |> List.fold_left
+         (fun acc _ ->
+           match acc with
+           | Error _ as e -> e
+           | Ok entries -> (
+               match parse_entry ic with
+               | Ok entry -> Ok (entry :: entries)
+               | Error e -> Error (entries, e)))
+         (Ok [])
+  with
+  | Ok entries -> Ok (List.rev entries)
+  | Error (entries, e) -> Error (List.rev entries, e)
 
 let parse_trailer ic =
   let len = in_channel_length ic - pos_in ic in
@@ -176,9 +197,16 @@ let parse_trailer ic =
   b
 
 let read path =
-  let ic = open_in_bin path in
-  let header = parse_header ic in
-  let entries = parse_entries ic header.number_of_objects in
-  let trailer = parse_trailer ic in
-  close_in ic;
-  { header; entries; trailer }
+  try
+    let ic = open_in_bin path in
+    let header = parse_header ic in
+    let entries = parse_entries ic header.number_of_objects in
+    let trailer =
+      if Result.is_ok entries then parse_trailer ic else Bytes.empty
+    in
+    close_in ic;
+    match entries with
+    | Ok entries -> Ok { header; entries; trailer }
+    | Error (entries, e) ->
+        Error (Partial_entries ({ header; entries; trailer }, e))
+  with Sys_error e -> Error (Failed e)
