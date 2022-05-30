@@ -3,5 +3,6 @@
  (libraries ogit alcotest fpath))
 
 (rule
- (alias  runtest)
- (action (run ./test.exe)))
+ (alias runtest)
+ (action
+  (run ./test.exe)))
