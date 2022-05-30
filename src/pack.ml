@@ -24,13 +24,18 @@ type entry = {
 
 type t = { header : header; entries : entry list; trailer : bytes }
 
-type error =
+type read_error =
   | Invalid_data of string
   | Not_supported of string
   | Failed of string
-  | Partial_entries of t * error
+  | Partial_entries of entry list
+  | Partial_read of t
 
-type read_result = (t, error) result
+type read_result = (t, read_error list) result
+
+module R = Error.Make (struct
+  type error = read_error
+end)
 
 let object_type_to_string = function
   | Invalid -> "invalid"
@@ -96,11 +101,11 @@ let parse_data ic =
         let len = De.io_buffer_size - Inf.dst_rem decoder in
         bigstring_output o len;
         Inf.flush decoder |> go
-    | `Malformed err -> Error (Invalid_data (Format.asprintf "%s." err))
+    | `Malformed err -> R.fail (Invalid_data (Format.asprintf "%s." err))
     | `End decoder ->
         let len = De.io_buffer_size - Inf.dst_rem decoder in
         if len > 0 then bigstring_output o len;
-        Ok (Buffer.to_bytes buf)
+        R.return (Buffer.to_bytes buf)
   in
   go decoder
 
@@ -113,12 +118,12 @@ let rec parse_entry ic =
   let object_type, data =
     match original_object_type with
     | Ofs_Delta -> parse_ofs_delta ic pos
-    | Ref_Delta -> (Invalid, Error (Not_supported "ref delta"))
+    | Ref_Delta -> (Invalid, R.fail (Not_supported "ref delta"))
     | _ -> (original_object_type, parse_data ic)
   in
   match data with
   | Ok data ->
-      Ok { object_type; length; data; offset = pos; original_object_type }
+      R.return { object_type; length; data; offset = pos; original_object_type }
   | Error _ as e -> e
 
 and parse_ofs_delta ic pos =
@@ -133,7 +138,7 @@ and parse_ofs_delta ic pos =
       seek_in ic data_pos;
       let transform_data = parse_data ic in
       match (entry.data, transform_data) with
-      | _, Error _ -> (Invalid, Error (Failed "error parsing ofs delta"))
+      | _, Error e -> (Invalid, R.fail_cons (Failed "error parsing ofs delta") e)
       | base_data, Ok transform_data ->
           let buf = Buffer.create 0 in
           let s = Stream.of_bytes transform_data in
@@ -172,7 +177,7 @@ and parse_ofs_delta ic pos =
               Buffer.add_bytes buf (read_bytes size)
           done;
           assert (dst_size = Buffer.length buf);
-          (entry.object_type, Ok (Buffer.to_bytes buf)))
+          (entry.object_type, R.return (Buffer.to_bytes buf)))
 
 let parse_entries ic n =
   match
@@ -183,12 +188,12 @@ let parse_entries ic n =
            | Error _ as e -> e
            | Ok entries -> (
                match parse_entry ic with
-               | Ok entry -> Ok (entry :: entries)
-               | Error e -> Error (entries, e)))
-         (Ok [])
+               | Ok entry -> R.return (entry :: entries)
+               | Error e -> R.fail_cons (Partial_entries (List.rev entries)) e))
+         (R.return [])
   with
-  | Ok entries -> Ok (List.rev entries)
-  | Error (entries, e) -> Error (List.rev entries, e)
+  | Error _ as e -> e
+  | Ok entries -> R.return (List.rev entries)
 
 let parse_trailer ic =
   let len = in_channel_length ic - pos_in ic in
@@ -206,7 +211,10 @@ let read path =
     in
     close_in ic;
     match entries with
-    | Ok entries -> Ok { header; entries; trailer }
-    | Error (entries, e) ->
-        Error (Partial_entries ({ header; entries; trailer }, e))
-  with Sys_error e -> Error (Failed e)
+    | Ok entries -> R.return { header; entries; trailer }
+    | Error es -> (
+        match es with
+        | Partial_entries entries :: tl ->
+            R.fail_cons (Partial_read { header; entries; trailer }) tl
+        | es -> R.fail_all es)
+  with Sys_error e -> R.fail @@ Failed e

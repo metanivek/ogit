@@ -1,10 +1,12 @@
 let bind_read (r : Ogit.Pack.read_result) (f : Ogit.Pack.t -> unit) =
   match r with
-  | Error e -> (
+  | Error [] -> Alcotest.fail "unexpected empty error"
+  | Error (e :: _) -> (
       match e with
       | Invalid_data s | Not_supported s | Failed s ->
           Alcotest.fail (Format.sprintf "unexpected error %s" s)
-      | Partial_entries _ -> Alcotest.fail "partial entries")
+      | Partial_entries _ -> Alcotest.fail "partial entries"
+      | Partial_read _ -> Alcotest.fail "partial read")
   | Ok pack -> f pack
 
 let ( >>= ) = bind_read

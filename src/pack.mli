@@ -24,13 +24,14 @@ type entry = {
 
 type t = { header : header; entries : entry list; trailer : bytes }
 
-type error =
+type read_error =
   | Invalid_data of string
   | Not_supported of string
   | Failed of string
-  | Partial_entries of t * error
+  | Partial_entries of entry list
+  | Partial_read of t
 
-type read_result = (t, error) result
+type read_result = (t, read_error list) result
 
 val read : string -> read_result
 (** [read path] reads and parses pack file at path *)
