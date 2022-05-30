@@ -109,6 +109,8 @@ let parse_data ic =
   in
   go decoder
 
+exception DeltaOfsZeroOpCode
+
 let rec parse_entry ic =
   let pos = pos_in ic in
   let original_object_type = parse_object_type ic in
@@ -139,7 +141,7 @@ and parse_ofs_delta ic pos =
       let transform_data = parse_data ic in
       match (entry.data, transform_data) with
       | _, Error e -> (Invalid, R.fail_cons (Failed "error parsing ofs delta") e)
-      | base_data, Ok transform_data ->
+      | base_data, Ok transform_data -> (
           let buf = Buffer.create 0 in
           let s = Stream.of_bytes transform_data in
           let next_byte () = Stream.next s in
@@ -148,36 +150,39 @@ and parse_ofs_delta ic pos =
           let src_size = Encoding.read_size next_int in
           let dst_size = Encoding.read_size next_int in
           assert (src_size = Bytes.length base_data);
-          while Option.is_some @@ Stream.peek s do
-            let byte = next_int () in
-            if byte = 0 then failwith "unexpected delta opcode 0"
-            else if byte land 0x80 != 0 then
-              (* copy data *)
-              let vals =
-                Array.init 7 Fun.id
-                |> Array.map (fun i ->
-                       let mask = 1 lsl i in
-                       if byte land mask != 0 then next_int () else 0)
-              in
-              let get_int_le bytes =
-                let value = ref 0 in
-                bytes
-                |> Array.iteri (fun i b ->
-                       let shift = i * 8 in
-                       value := !value lor (b lsl shift));
-                !value
-              in
-              let offset = get_int_le (Array.sub vals 0 4) in
-              let size = get_int_le (Array.sub vals 4 3) in
-              let size = if size = 0 then 0x10000 else size in
-              Buffer.add_bytes buf (Bytes.sub base_data offset size)
-            else
-              (* append data *)
-              let size = byte land 0x7f in
-              Buffer.add_bytes buf (read_bytes size)
-          done;
-          assert (dst_size = Buffer.length buf);
-          (entry.object_type, R.return (Buffer.to_bytes buf)))
+          try
+            while Option.is_some @@ Stream.peek s do
+              let byte = next_int () in
+              if byte = 0 then raise DeltaOfsZeroOpCode
+              else if byte land 0x80 != 0 then
+                (* copy data *)
+                let vals =
+                  Array.init 7 Fun.id
+                  |> Array.map (fun i ->
+                         let mask = 1 lsl i in
+                         if byte land mask != 0 then next_int () else 0)
+                in
+                let get_int_le bytes =
+                  let value = ref 0 in
+                  bytes
+                  |> Array.iteri (fun i b ->
+                         let shift = i * 8 in
+                         value := !value lor (b lsl shift));
+                  !value
+                in
+                let offset = get_int_le (Array.sub vals 0 4) in
+                let size = get_int_le (Array.sub vals 4 3) in
+                let size = if size = 0 then 0x10000 else size in
+                Buffer.add_bytes buf (Bytes.sub base_data offset size)
+              else
+                (* append data *)
+                let size = byte land 0x7f in
+                Buffer.add_bytes buf (read_bytes size)
+            done;
+            assert (dst_size = Buffer.length buf);
+            (entry.object_type, R.return (Buffer.to_bytes buf))
+          with DeltaOfsZeroOpCode ->
+            (Invalid, R.fail (Failed "unexpected delta opcode 0"))))
 
 let parse_entries ic n =
   match
