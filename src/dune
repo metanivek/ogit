@@ -1,5 +1,6 @@
 (library
  (name ogit)
+ (public_name ogit)
  (libraries checkseum.ocaml decompress.zl)
  (inline_tests)
  (preprocess

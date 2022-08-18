@@ -1,6 +1,6 @@
 version = 0.21.0
 profile = conventional
 
-ocaml-version = 4.08.0
+ocaml-version = 4.13.1
 break-infix = fit-or-vertical
 parse-docstrings = true

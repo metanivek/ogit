@@ -11,7 +11,7 @@
 
 (maintainers "metanivek")
 
-(license LICENSE)
+(license 0BSD)
 
 (package
  (name ogit)

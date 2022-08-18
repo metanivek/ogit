@@ -4,7 +4,7 @@ synopsis: "Git data playground"
 description: "Git data playground"
 maintainer: ["metanivek"]
 authors: ["metanivek"]
-license: "LICENSE"
+license: "0BSD"
 tags: ["git" "playground"]
 homepage: "https://github.com/metanivek/ogit"
 bug-reports: "https://github.com/metanivek/ogit/issues"

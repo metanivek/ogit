@@ -1,1 +1,3 @@
-Just a place to play with OCaml and git data
+# ogit
+
+A playground for OCaml + git on-disk data formats
